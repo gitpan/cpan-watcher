@@ -1,0 +1,552 @@
+#!/apps/perl5/bin/perl -w
+
+#-----------------------------------------------------------------------
+
+=head1 NAME
+
+cpan-watcher - keep of uploads to CPAN, and generating a what's new page
+
+=head1 SYNOPSIS
+
+  cpan-watcher [ -proxy <ftp-proxy> ]
+               [ -host <cpan-ftp-host> ]
+               [ -root <root-directory> ]
+               [ -webdir <directory> ]
+               [ -mailto <email-address> ]
+               [ -debug ]
+               [ -verbose ]
+               [ -version ]
+               [ -help ]
+
+=cut
+
+#-----------------------------------------------------------------------
+
+use strict;
+use vars qw(%CPAN $VERSION %REPORT @keys);
+
+use App::Config;
+use Net::FTP;
+use GDBM_File;
+use IO::File;
+use IO::Pipe;
+use Date::Format;
+
+#-----------------------------------------------------------------------
+#       CONFIGURATION CONSTANTS
+#-----------------------------------------------------------------------
+use constant CPAN_DEFAULT_HOST => 'ftp.funet.fi';
+use constant CPAN_DEFAULT_ROOT => '/pub/languages/perl/CPAN/authors/id';
+
+my $PROGRAM    = 'CPAN Watcher';
+my $SENDMAIL   = '/usr/lib/sendmail';
+   $VERSION    = '1.3';
+
+my $SITE;
+my $ftp;
+my $config;
+my %README;
+my $DATE       = time2str("%a %e %b %Y", time());
+my $LASTDATE;
+
+
+#-----------------------------------------------------------------------
+#       MAIN BODY
+#-----------------------------------------------------------------------
+
+cw_initialise();
+
+tie %CPAN, 'GDBM_File', $config->database(), &GDBM_WRCREAT, 0640;
+
+$LASTDATE = $CPAN{_DATE} if (exists $CPAN{_DATE});
+
+check_directory($config->root);
+$ftp->quit;
+
+$CPAN{_DATE} = $DATE;
+untie %CPAN;
+
+&create_webpage();
+@keys = sort keys %REPORT;
+&generate_report() if $config->mailto && @keys > 0;
+
+exit 0;
+
+#=======================================================================
+# cs_initialise() - parse config file, command-line, create FTP object
+#=======================================================================
+sub cw_initialise
+{
+    my $config_file = "$ENV{'HOME'}/.cpan-watcher";
+    my $cpan_host;
+
+
+    #-------------------------------------------------------------------
+    # Create App::Config object, and define our configuration
+    # variables.
+    #-------------------------------------------------------------------
+    $config = new App::Config();
+    $config->define('proxy',
+                 {
+                  CMDARG   => '-proxy',
+                  ARGCOUNT => 1,
+                 });
+    $config->define('host',
+                 {
+                  CMDARG   => '-host',
+                  ARGCOUNT => 1,
+                  DEFAULT  => CPAN_DEFAULT_HOST,
+                 });
+    $config->define('root',
+                 {
+                  CMDARG   => '-root',
+                  ARGCOUNT => 1,
+                  DEFAULT  => CPAN_DEFAULT_ROOT,
+                 });
+    $config->define('database',
+                 {
+                  CMDARG => '-database',
+                  ARGCOUNT => 1,
+                 });
+    $config->define('webdir',
+                 {
+                  CMDARG => '-webdir',
+                  ARGCOUNT => 1,
+                 });
+    $config->define('mailto',
+                 {
+                  CMDARG => '-mailto',
+                  ARGCOUNT => 1,
+                 });
+    $config->define('proxy',
+                 {
+                  CMDARG => '-proxy',
+                  ARGCOUNT => 1,
+                 });
+    $config->define('verbose', { CMDARG => '-verbose' } );
+    $config->define('debug',   { CMDARG => '-debug' } );
+    $config->define('help',    { CMDARG => '-help' } );
+    $config->define('version', { CMDARG => '-version' } );
+
+    #-------------------------------------------------------------------
+    # Read the user's config file, if they have one,
+    # then parse the command-line.
+    #-------------------------------------------------------------------
+    $config->cfg_file($config_file) if -f $config_file;
+    $config->cmd_line(\@ARGV);
+
+    #-------------------------------------------------------------------
+    # Did they give one of the informational switches?
+    #-------------------------------------------------------------------
+    show_help()    if $config->help;
+    show_version() if $config->version;
+
+    #-------------------------------------------------------------------
+    # Check for required configuration variables
+    #-------------------------------------------------------------------
+    die "You must give a database path!\n" unless $config->database();
+    if (not $config->webdir())
+    {
+        die "You must give me somewhere to create the web pages (-webdir)!\n";
+    }
+
+    $SITE = $config->host;
+
+    #-------------------------------------------------------------------
+    # Now we're OK to create an instance of Net::FTP
+    #-------------------------------------------------------------------
+    $cpan_host = $config->host || CPAN_DEFAULT_HOST;
+    print "using CPAN host: $cpan_host\n";
+    if ($config->proxy)
+    {
+        print "PROXY: ", $config->proxy, "\n";
+    }
+    $ftp = new Net::FTP($cpan_host,
+                        ($config->proxy
+                         ? ('Firewall', $config->proxy())
+                         : ()));
+    if (not defined $ftp)
+    {
+        die "failed to create instance of Net::FTP: $!\n";
+    }
+    $ftp->login('ftp', 'neilb@cre.canon.co.uk');
+}
+
+#=======================================================================
+# show_help() - display a short help message (in response to -help)
+#=======================================================================
+sub show_help
+{
+print <<EOFHELP;
+
+    cpan-watcher $VERSION - keep an eye on Perl modules on CPAN
+
+    Usage: cpan-watcher [ options ]
+              -host <hostname>      ftp host to use for checking
+              -mailto <email>       who to email the summary to
+              -proxy <host>         proxy to use when making HTTP request
+              -version              display the version number of script
+              -help                 display this short help message
+              -doc                  display the full documentation
+
+EOFHELP
+
+    exit 0;
+}
+
+#=======================================================================
+# show_version() - show the version of script (in response to -version)
+#=======================================================================
+sub show_version
+{
+    print STDERR "$VERSION\n";
+    exit 0;
+}
+
+#=======================================================================
+# check_directory() - check the given directory
+#=======================================================================
+sub check_directory
+{
+    my $path = shift;
+
+    my $ref;
+    my $line;
+    my($mode, $links, $user, $group, $size, $date, $filename);
+    my $filepath;
+    my $stem;
+    my $url;
+    my $ROOTDIR = $config->root();
+
+
+    #-------------------------------------------------------------------
+    # Be nice to the server
+    #-------------------------------------------------------------------
+    # sleep 2;
+
+    Verbose("  $path ...\n");
+
+    if (not $ftp->cwd($path))
+    {
+        die "failed to changed directory to $path: ", $ftp->message, "\n";
+    }
+    $ref = $ftp->dir();
+
+    foreach $line (@$ref)
+    {
+	($mode, $links, $user, $group, $size, $date, $filename) =
+	    $line =~ /^(\S+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+\s+\S+\s+\S+)\s+(\S+)/;
+	$filepath = "$path/$filename";
+
+	next if $filename eq 'CHECKSUMS';
+
+	#---------------------------------------------------------------
+	# Is it a directory? If so, recurse
+	#---------------------------------------------------------------
+	if ($mode =~ /^\s*d/)
+	{
+	    check_directory($filepath);
+	}
+	elsif ($mode =~ /^l/)
+	{
+	    #-----------------------------------------------------------
+	    # ignore symlinks
+	    #-----------------------------------------------------------
+	    next;
+	}
+	elsif ($mode =~ /^-/)
+	{
+	    #-----------------------------------------------------------
+	    # regular file. Should we just do it for everything left?
+	    #-----------------------------------------------------------
+	    ($stem = $filepath) =~ s!$ROOTDIR/!!;
+	    if (!defined $CPAN{$stem})
+	    {
+		$CPAN{$stem} = $date;
+		$REPORT{$stem} = 'NEW';
+                Verbose("\t$stem (NEW)");
+	    }
+	    elsif ($CPAN{$stem} ne $date)
+	    {
+		$CPAN{$stem} = $date;
+
+                #-------------------------------------------------------
+                # When Unix lists files, the dates are different for
+                # files which are older than six months, and for those
+                # which are younger than 6 months
+                #       Younger: DD MMM HH:MM
+                #       Older:   DD MMM  YYYY
+                #-------------------------------------------------------
+                if (substr($CPAN{$stem},0,6) eq substr($date, 0, 6)
+                         && $date !~ /:/)
+		{
+		    next;
+		}
+
+		$REPORT{$stem} = $date;
+	    }
+	}
+    }
+}
+
+#=======================================================================
+# generate_report() - send an email message to the specified recipients
+#=======================================================================
+sub generate_report
+{
+    my $PIPE;
+    my $file;
+    my $status;
+
+
+    return unless $config->mailto();
+
+    Verbose("mailing summary report to ", $config->mailto());
+    $PIPE = new IO::Pipe();
+    $PIPE->writer("$SENDMAIL ".$config->mailto()) || do
+    {
+	warn "Unable to open pipe to $SENDMAIL: $!\n";
+    };
+
+    print $PIPE "From: perl\@cre.canon.co.uk (Neil Bowers)\n";
+    print $PIPE "Subject: CPAN update\n";
+    print $PIPE "\n";
+    print $PIPE "$PROGRAM v$VERSION\n";
+    print $PIPE "    Site:      $SITE\n";
+    print $PIPE "    Directory: ", $config->root, "\n\n";
+
+    foreach $file (sort keys %REPORT)
+    {
+	printf $PIPE "    %12s  $file\n", $REPORT{$file};
+    }
+    $PIPE->close();
+}
+
+#=======================================================================
+# create_webpage() - create web page with summary of new files
+#=======================================================================
+sub create_webpage
+{
+    my $HTML;
+    my $url;
+    my $stem;
+    my $title;
+    my $year;
+    my $directory;
+    my $filename;
+
+
+    #-------------------------------------------------------------------
+    # Make sure we have a directory for the current year
+    #-------------------------------------------------------------------
+    $year = time2str("%Y", time());
+    $directory = $config->webdir()."/$year";
+    if ((not -d $directory)
+        && !mkdir($directory, 0755))
+    {
+        die "failed to create directory $directory: $!\n";
+    }
+
+    #-------------------------------------------------------------------
+    # Filename is WEBDIR/YYYY/YYYY-MM-DD.html
+    #-------------------------------------------------------------------
+    $filename = $directory.'/'.time2str("%Y-%m-%d", time()).".html";
+    $HTML = new IO::File("> $filename");
+    if (not defined $HTML)
+    {
+        die "Couldn't write to webpage $filename: $!\n";
+    }
+
+    $title = "What's New on CPAN";
+    print $HTML "<HTML><HEAD><TITLE>$title</TITLE></HEAD>\n";
+    print $HTML "<BODY BGCOLOR=\"#ffffff\">";
+    print $HTML "<H1 ALIGN=CENTER>$title<HR WIDTH=\"50%\"></H1>\n";
+    if (defined $LASTDATE)
+    {
+        print $HTML "<P ALIGN=CENTER>CPAN Uploads $LASTDATE - $DATE</P>\n";
+    }
+    else
+    {
+        print $HTML "<P ALIGN=CENTER>CPAN Uploads - $DATE</P>\n";
+    }
+    print $HTML "<DIV ALIGN=CENTER><TABLE BORDER=0 CELLPADDING=4>\n";
+
+    #-------------------------------------------------------------------
+    # Pull out any READMEs associated with files seen, and put them
+    # in the README hash under the relevant file
+    #-------------------------------------------------------------------
+    foreach $stem (keys %REPORT)
+    {
+        if ($stem =~ /^(.*)\.readme$/
+            && exists $REPORT{"$1.tar.gz"})
+        {
+            print STDERR "    We got us a README: $stem\n";
+            delete $REPORT{$stem};
+            $README{"$1.tar.gz"} = $stem;
+        }
+    }
+
+    #-------------------------------------------------------------------
+    # Each file is a row in a table. The second column has a link to
+    # the associated README, if we found one.
+    #-------------------------------------------------------------------
+    foreach $stem (sort keys %REPORT)
+    {
+        $url = "ftp://$SITE/".$config->root()."/$stem";
+        print $HTML "<TR ALIGN=LEFT><TD><A HREF=\"$url\">$stem</A></A>";
+        if (exists $README{$stem})
+        {
+            print $HTML "<TD><A HREF=\"ftp://$SITE/",
+                  $config->root(), "/$README{$stem}\">README</A></TD>";
+        }
+        print $HTML "</TR>\n";
+    }
+
+    print $HTML "</TABLE></DIV>\n</BODY>\n</HTML>\n";
+    $HTML->close();
+}
+
+#=======================================================================
+# Verbose() - print the passed string(s) to STDERR if -verbose seen
+#=======================================================================
+sub Verbose
+{
+    my @messages = @_;
+
+    return unless $config->verbose();
+    print STDERR join('', @messages), "\n";
+}
+
+#-----------------------------------------------------------------------
+
+=head1 DESCRIPTION
+
+B<cpan-watcher> checks CPAN for any new modules, or more accurately,
+for any new files in the modules directory. Every time the script
+is run, the files seen are stored in a GDBM file, so we can check
+against them next time.
+
+At the end of each run, B<cpan-watcher> generates a web page
+which gives a summary of the files which are new, or have been updated,
+since the last time the script was run.
+
+You can also provide an email address, in which case B<cpan-watcher>
+will email a summary of what's new to the specified address.
+
+You can configure B<cpan-watcher> with a .cpan-watcher configuration file,
+as described below.
+
+B<cpan-watcher> ignores CHECKSUMS files.
+
+=head1 OPTIONS
+
+=over 4
+
+=item -host <host>
+
+Specifies the name of the CPAN ftp host which we should check.
+This defaults to C<ftp.funet.fi>.
+
+=item -root <directory>
+
+The path to the directory in which we should recurse, looking for files.
+Defaults to: C</pub/languages/perl/CPAN/authors/id>.
+
+=item -database <path>
+
+The path to the file which we should use to keep details of files
+seen on CPAN. You must specify this, either in a config file,
+or on the command-line.
+
+=item -webdir <path>
+
+The path to the directory in which we should create the web pages.
+
+=item -proxy <host>
+
+Specifies the name of the host which has your ftp firewall gateway,
+if you're behind a firewall. 
+
+=item -mailto <email>
+
+If this option is specified, then a summary of the new files
+will be mailed to the specified address.
+
+=item -help
+
+Displays a short help message.
+
+=item -verbose
+
+Turns on verbose information as the script runs.
+
+=item -debug
+
+Turns on debugging information. Useful mainly for the developer,
+it displays the HTTP request and response.
+
+=item -version
+
+Display the version number of the B<cpan-watcher> script.
+
+=back
+
+
+=head1 CONFIGURATION FILE
+
+You can provide the configuration information needed
+via a C<.cpan-watcher> file in your home directory.
+All of the command-line variables which take a value can be
+included in your config file - just drop the leading dash.
+
+The following is a sample C<.cpan-watcher> file:
+
+    #
+    # .cpan-watcher - configuration file for cpan-watcher script
+    #
+    
+    proxy    = ftp-gateway.perl.com
+    host     = ftp.funet.fi
+    root     = /pub/languages/perl/CPAN/authors/id
+    mailto   = neilb@cre.canon.co.uk
+    database = /user/neilb/lib/cpan/database
+    webdir   = /user/neilb/public_html/cpan
+
+
+=head1 SEE ALSO
+
+=over 4
+
+=item http://www.cre.canon.co.uk/perl/
+
+Our Perl pages at Canon Research Centre Europe.
+We run B<cpan-watcher> weekly, so you can just refer to our web-pages,
+rather than running the script yourself.
+
+=item App::Config
+
+Andy Wardley's module for managing application configuration information.
+This supports command-line options and standard format configuration file
+for the same configuration options
+
+=item Net::FTP
+
+Graham Barr's module for performing FTP sessions. This is included
+as part of the libnet distribution.
+
+=back
+
+=head1 AUTHOR
+
+Neil Bowers E<lt>neilb@cre.canon.co.ukE<gt>
+
+=head1 COPYRIGHT
+
+Copyright (c) 1997,1998 Canon Research Centre Europe. All rights reserved.
+
+This script is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+=cut
+
+#-----------------------------------------------------------------------

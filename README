@@ -1,0 +1,39 @@
+
+				cpan-watcher
+
+This is a script for determining what's new on CPAN. It works by keeping
+a database of what was seen the last time you ran the script.
+
+We will be using this script to generate a "What's new on CPAN"
+on our web pages, at http://www.cre.canon.co.uk/perl/
+
+Once cpan-watcher has determined what's new, it can:
+
+   *	generate a web page, with links to the perl.com CPAN multiplexor,
+	to make it easy to grab things.
+
+   *	send a mail message to interested parties.
+
+To install this script, you should just have to run the following:
+
+	% perl Makefile.PL
+	% make install
+
+The script is fully documented using pod. Once installed you should get
+a man page. It also supports an informational switch:
+
+	-help	display a short help message
+
+The script requires the following, which are also available from CPAN:
+
+	Net::FTP
+	App::Config
+
+I'd be happy to hear of any suggestions for improving this script;
+the ToDo list and possible ideas for future work are listed in the doc.
+
+Neil Bowers <neilb@cre.canon.co.uk>
+Canon Research Centre Europe
+http://www.cre.canon.co.uk/
+--
+RCS ID: $Id: README,v 1.2 1998/04/02 23:28:15 neilb Exp $
